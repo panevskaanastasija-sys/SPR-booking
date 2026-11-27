@@ -12,6 +12,8 @@
     <link href="https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap" rel="stylesheet">
     <!-- Lucide Icons -->
     <script src="https://unpkg.com/lucide@latest"></script>
+    <!-- Supabase JS Client -->
+    <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
     <script>
         tailwind.config = {
             theme: {
@@ -106,6 +108,11 @@
                     <button onclick="openNewBookingModal()" class="inline-flex items-center gap-2 px-4 py-2.5 rounded-xl bg-navy-900 hover:bg-navy-850 text-white text-sm font-medium shadow-sm transition cursor-pointer">
                         <i data-lucide="calendar-plus" class="w-4 h-4 text-sky-300"></i>
                         <span>New Reservation</span>
+                    </button>
+
+                    <button onclick="loadBookings(true)" class="inline-flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 text-sm font-medium transition cursor-pointer" title="Refresh shared calendar">
+                        <i data-lucide="refresh-cw" class="w-4 h-4 text-slate-500"></i>
+                        <span class="hidden sm:inline">Refresh</span>
                     </button>
 
                     <button onclick="exportToCSV()" class="inline-flex items-center gap-2 px-3.5 py-2.5 rounded-xl bg-white hover:bg-slate-50 text-slate-700 border border-slate-300 text-sm font-medium transition cursor-pointer" title="Download full booking log as CSV">
@@ -465,7 +472,7 @@
                     <button type="button" onclick="closeNewBookingModal()" class="px-4 py-2 rounded-xl border border-slate-300 text-slate-700 text-sm font-medium hover:bg-slate-50 transition cursor-pointer">
                         Cancel
                     </button>
-                    <button type="submit" class="px-5 py-2 rounded-xl bg-navy-900 hover:bg-navy-850 text-white text-sm font-semibold shadow-sm transition cursor-pointer">
+                    <button type="submit" id="btn-submit-booking" class="px-5 py-2 rounded-xl bg-navy-900 hover:bg-navy-850 text-white text-sm font-semibold shadow-sm transition cursor-pointer">
                         Confirm Reservation
                     </button>
                 </div>
@@ -561,7 +568,7 @@
                 <h3 class="text-base font-bold text-slate-900">Clear All Instrument Bookings?</h3>
             </div>
             <p class="text-xs text-slate-600 leading-relaxed">
-                This will permanently erase all scheduled reservations from your browser's local storage. You can restore sample reservations anytime from the utility menu.
+                This will permanently erase all scheduled reservations from the shared facility database for all users. You can restore sample reservations anytime from the utility menu.
             </p>
             <div class="flex justify-end gap-2 pt-2">
                 <button onclick="closeClearAllModal()" class="px-4 py-2 rounded-xl border border-slate-300 text-xs font-semibold text-slate-700 hover:bg-slate-50 cursor-pointer">Cancel</button>
@@ -571,11 +578,15 @@
     </div>
 
     <!-- ===================================================================== -->
-    <!-- APPLICATION LOGIC                                                     -->
+    <!-- APPLICATION LOGIC (SUPABASE SYNC)                                     -->
     <!-- ===================================================================== -->
     <script>
+        // Supabase Configuration
+        const SUPABASE_URL = 'https://kazjrmkwxsjrkvtoay.supabase.co';
+        const SUPABASE_KEY = 'sb_publishable_LB5Aa0k_MeWwocZJJDTd0g_0P1kwn_k';
+        const supabaseClient = window.supabase.createClient(SUPABASE_URL, SUPABASE_KEY);
+
         // Constants & Configuration
-        const STORAGE_KEY = 'spr_biacore_1s_bookings_v1';
         const START_HOUR = 8;   // 08:00
         const END_HOUR = 20;    // 20:00
         const HOUR_HEIGHT_PX = 56; // Matches 3.5rem grid lines
@@ -627,7 +638,6 @@
         function generateDefaultBookings() {
             const mon = getMonday(new Date());
             const tue = addDays(mon, 1);
-            const wed = addDays(mon, 2);
             const thu = addDays(mon, 3);
             const fri = addDays(mon, 4);
 
@@ -705,27 +715,23 @@
             ];
         }
 
-        // Load & Save Persistence
-        function loadBookings() {
+        // Load Bookings from Shared Supabase Database
+        async function loadBookings(showRefreshToast = false) {
             try {
-                const raw = localStorage.getItem(STORAGE_KEY);
-                if (raw) {
-                    bookings = JSON.parse(raw);
-                } else {
-                    bookings = generateDefaultBookings();
-                    saveBookings();
+                const { data, error } = await supabaseClient
+                    .from('bookings')
+                    .select('*');
+
+                if (error) throw error;
+
+                bookings = data || [];
+                renderAll();
+                if (showRefreshToast) {
+                    showToast('Schedule synced with shared database.', 'info');
                 }
             } catch (e) {
-                console.error('Failed to read localStorage:', e);
-                bookings = generateDefaultBookings();
-            }
-        }
-
-        function saveBookings() {
-            try {
-                localStorage.setItem(STORAGE_KEY, JSON.stringify(bookings));
-            } catch (e) {
-                showToast('Could not save reservation to browser storage.', 'error');
+                console.error('Failed to load bookings from Supabase:', e);
+                showToast('Could not load shared schedule. Check connection.', 'error');
             }
         }
 
@@ -1169,9 +1175,10 @@
             }
         }
 
-        function handleBookingSubmit(event) {
+        async function handleBookingSubmit(event) {
             event.preventDefault();
 
+            const submitBtn = document.getElementById('btn-submit-booking');
             const name = document.getElementById('input-name').value.trim();
             const department = document.getElementById('input-department').value;
             const email = document.getElementById('input-email').value.trim();
@@ -1183,38 +1190,62 @@
             const buffer = document.getElementById('input-buffer').value;
             const notes = document.getElementById('input-notes').value.trim();
 
-            if (!validateLiveConflict()) {
-                return;
+            submitBtn.disabled = true;
+            submitBtn.textContent = 'Saving...';
+
+            try {
+                // Fetch latest bookings first to prevent race-condition double bookings
+                const { data: latestData, error: fetchError } = await supabaseClient
+                    .from('bookings')
+                    .select('*');
+                if (fetchError) throw fetchError;
+                bookings = latestData || [];
+
+                if (!validateLiveConflict()) {
+                    renderAll();
+                    return;
+                }
+
+                const newBooking = {
+                    id: 'bk-' + Date.now() + '-' + Math.floor(Math.random() * 1000),
+                    name,
+                    department,
+                    email,
+                    date,
+                    startTime,
+                    endTime,
+                    chip,
+                    buffer,
+                    experiment,
+                    notes,
+                    isMaintenance: false
+                };
+
+                const { error: insertError } = await supabaseClient
+                    .from('bookings')
+                    .insert([newBooking]);
+
+                if (insertError) throw insertError;
+
+                bookings.push(newBooking);
+
+                // Jump calendar to the booked date's week so user immediately sees it
+                currentWeekMonday = getMonday(parseLocalDate(date));
+                renderAll();
+
+                // Reset partial fields & close modal
+                document.getElementById('input-notes').value = '';
+                document.getElementById('input-sop-ack').checked = false;
+                closeNewBookingModal();
+
+                showToast(`Reserved Biacore 1S+ on ${date} (${startTime}–${endTime})`, 'success');
+            } catch (e) {
+                console.error('Failed to save booking:', e);
+                showToast('Could not save reservation to database.', 'error');
+            } finally {
+                submitBtn.disabled = false;
+                submitBtn.textContent = 'Confirm Reservation';
             }
-
-            const newBooking = {
-                id: 'bk-' + Date.now(),
-                name,
-                department,
-                email,
-                date,
-                startTime,
-                endTime,
-                chip,
-                buffer,
-                experiment,
-                notes,
-                isMaintenance: false
-            };
-
-            bookings.push(newBooking);
-            saveBookings();
-
-            // Jump calendar to the booked date's week so user immediately sees it
-            currentWeekMonday = getMonday(parseLocalDate(date));
-            renderAll();
-
-            // Reset partial fields & close modal
-            document.getElementById('input-notes').value = '';
-            document.getElementById('input-sop-ack').checked = false;
-            closeNewBookingModal();
-
-            showToast(`Reserved Biacore 1S+ on ${date} (${startTime}–${endTime})`, 'success');
         }
 
         // Detail & Cancellation Modal
@@ -1258,12 +1289,23 @@
             document.getElementById('detail-footer-actions').classList.remove('hidden');
         }
 
-        function deleteBooking(id) {
-            bookings = bookings.filter(b => b.id !== id);
-            saveBookings();
-            closeDetailModal();
-            renderAll();
-            showToast('Reservation cancelled and slot released.', 'info');
+        async function deleteBooking(id) {
+            try {
+                const { error } = await supabaseClient
+                    .from('bookings')
+                    .delete()
+                    .eq('id', id);
+
+                if (error) throw error;
+
+                bookings = bookings.filter(b => b.id !== id);
+                closeDetailModal();
+                renderAll();
+                showToast('Reservation cancelled and slot released.', 'info');
+            } catch (e) {
+                console.error('Failed to delete booking:', e);
+                showToast('Could not cancel reservation in database.', 'error');
+            }
         }
 
         // Utility Menu & Data Management
@@ -1278,13 +1320,29 @@
             }
         });
 
-        function resetDemoData() {
-            bookings = generateDefaultBookings();
-            saveBookings();
-            currentWeekMonday = getMonday(new Date());
-            renderAll();
+        async function resetDemoData() {
             document.getElementById('utility-menu').classList.add('hidden');
-            showToast('Restored default weekly SPR facility schedule.', 'success');
+            try {
+                const { error: delError } = await supabaseClient
+                    .from('bookings')
+                    .delete()
+                    .neq('id', '');
+                if (delError) throw delError;
+
+                const defaults = generateDefaultBookings();
+                const { error: insError } = await supabaseClient
+                    .from('bookings')
+                    .insert(defaults);
+                if (insError) throw insError;
+
+                bookings = defaults;
+                currentWeekMonday = getMonday(new Date());
+                renderAll();
+                showToast('Restored default weekly SPR facility schedule.', 'success');
+            } catch (e) {
+                console.error('Failed to reset demo data:', e);
+                showToast('Could not reset demo schedule.', 'error');
+            }
         }
 
         function promptClearAll() {
@@ -1297,12 +1355,22 @@
             document.getElementById('clear-all-modal').classList.add('hidden');
         }
 
-        function executeClearAll() {
-            bookings = [];
-            saveBookings();
-            closeClearAllModal();
-            renderAll();
-            showToast('All reservations cleared from schedule.', 'info');
+        async function executeClearAll() {
+            try {
+                const { error } = await supabaseClient
+                    .from('bookings')
+                    .delete()
+                    .neq('id', '');
+                if (error) throw error;
+
+                bookings = [];
+                closeClearAllModal();
+                renderAll();
+                showToast('All reservations cleared from shared schedule.', 'info');
+            } catch (e) {
+                console.error('Failed to clear all bookings:', e);
+                showToast('Could not clear reservations.', 'error');
+            }
         }
 
         // Export to CSV for Facility Usage Tracking & Billing
@@ -1394,9 +1462,14 @@
         window.addEventListener('DOMContentLoaded', () => {
             populateTimeSelects();
             loadBookings();
-            renderAll();
-            // Refresh live instrument status indicator every 60 seconds
-            setInterval(updateDashboardStats, 60000);
+            // Auto-sync shared schedule every 30 seconds
+            setInterval(() => loadBookings(false), 30000);
+            // Also refresh when user returns to this browser tab
+            document.addEventListener('visibilitychange', () => {
+                if (document.visibilityState === 'visible') {
+                    loadBookings(false);
+                }
+            });
         });
     </script>
 </body>
